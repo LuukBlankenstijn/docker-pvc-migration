@@ -1,23 +1,29 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
 	"github.com/LuukBlankenstijn/docker-pvc-migration/internal/docker"
 	"github.com/LuukBlankenstijn/docker-pvc-migration/internal/kubernetes"
 	"github.com/LuukBlankenstijn/docker-pvc-migration/internal/matcher"
+	"github.com/LuukBlankenstijn/docker-pvc-migration/internal/migration"
 	"github.com/LuukBlankenstijn/docker-pvc-migration/internal/ui"
 	"github.com/LuukBlankenstijn/docker-pvc-migration/internal/yaml"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run main.go <yaml-directory>")
+	var execute = flag.Bool("execute", false, "Execute the migration (default is dry-run)")
+	var namespace = flag.String("namespace", "default", "Kubernetes namespace for PVCs")
+	flag.Parse()
+
+	if len(flag.Args()) < 1 {
+		fmt.Println("Usage: go run main.go [--execute] [--namespace=default] <yaml-directory>")
 		os.Exit(1)
 	}
 
-	yamlDir := os.Args[1]
+	yamlDir := flag.Args()[0]
 
 	// Initialize Docker client
 	dockerClient, err := docker.NewClient()
@@ -73,5 +79,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Configuration complete. YAML files updated with new PVC sizes!")
+	// Migration phase
+	migrationEngine := migration.NewEngine(*namespace)
+
+	if *execute {
+		fmt.Println("\n🚀 Starting actual migration...")
+		if err := migrationEngine.StartMigration(matchedPVCs); err != nil {
+			fmt.Printf("Migration failed: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		migrationEngine.DryRun(matchedPVCs)
+	}
+
+	fmt.Println("Process complete!")
 }
