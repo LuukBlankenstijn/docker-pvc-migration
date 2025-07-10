@@ -80,7 +80,7 @@ func main() {
 	}
 
 	// Migration phase
-	migrationEngine := migration.NewEngine(*namespace)
+	migrationEngine := migration.NewEngine(*namespace, yamlDir)
 
 	if *execute {
 		fmt.Println("\n🚀 Starting actual migration...")

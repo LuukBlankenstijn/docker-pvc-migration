@@ -1,24 +1,33 @@
 package migration
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/LuukBlankenstijn/docker-pvc-migration/internal/types"
+	"gopkg.in/yaml.v3"
 )
 
 type Engine struct {
-	namespace string
+	migrationNamespace string // Namespace for migration pods
+	yamlDirectory      string // Directory containing YAML files
 }
 
-func NewEngine(namespace string) *Engine {
-	if namespace == "" {
-		namespace = "default"
+func NewEngine(migrationNamespace, yamlDirectory string) *Engine {
+	if migrationNamespace == "" {
+		migrationNamespace = "default"
 	}
-	return &Engine{namespace: namespace}
+	return &Engine{
+		migrationNamespace: migrationNamespace,
+		yamlDirectory:      yamlDirectory,
+	}
 }
 
 func (e *Engine) StartMigration(pvcs []*types.PVCInfo) error {
@@ -45,14 +54,14 @@ func (e *Engine) StartMigration(pvcs []*types.PVCInfo) error {
 }
 
 func (e *Engine) migratePVC(pvc *types.PVCInfo) error {
-	// Step 1: Create the PVC
-	fmt.Printf("  Creating PVC %s...\n", pvc.Name)
+	// Apply the specific YAML file for this PVC
+	fmt.Printf("  Applying YAML file for PVC %s to namespace %s...\n", pvc.Name, e.migrationNamespace)
 	if err := e.createPVC(pvc); err != nil {
-		return fmt.Errorf("failed to create PVC: %v", err)
+		return fmt.Errorf("failed to apply YAML file: %v", err)
 	}
 
 	// Step 2: Wait for PVC to be bound
-	fmt.Printf("  Waiting for PVC to be bound...\n")
+	fmt.Printf("  Waiting for PVC %s to be bound...\n", pvc.Name)
 	if err := e.waitForPVCBound(pvc); err != nil {
 		return fmt.Errorf("PVC not bound: %v", err)
 	}
@@ -67,34 +76,77 @@ func (e *Engine) migratePVC(pvc *types.PVCInfo) error {
 }
 
 func (e *Engine) createPVC(pvc *types.PVCInfo) error {
-	// Use kubectl to create the PVC from the YAML files
-	// We assume the YAML files have already been updated with the correct sizes
+	// Find and apply only the YAML file containing this specific PVC
+	yamlFile, err := e.findYAMLFileForPVC(pvc)
+	if err != nil {
+		return fmt.Errorf("failed to find YAML file for PVC %s: %v", pvc.Name, err)
+	}
 
-	// Find the YAML file containing this PVC and apply it
-	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	fmt.Printf("    Applying %s to namespace %s...\n", yamlFile, e.migrationNamespace)
 
-	// Generate PVC YAML directly
-	pvcYAML := fmt.Sprintf(`apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: %s
-  namespace: %s
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: %s
-  storageClassName: longhorn
-`, pvc.Name, pvc.Namespace, pvc.NewSize)
-
-	cmd.Stdin = strings.NewReader(pvcYAML)
+	// Apply the specific YAML file to the specified namespace
+	cmd := exec.Command("kubectl", "apply", "-f", yamlFile, "-n", e.migrationNamespace)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("kubectl apply failed: %v\nOutput: %s", err, string(output))
 	}
 
 	return nil
+}
+
+func (e *Engine) findYAMLFileForPVC(pvc *types.PVCInfo) (string, error) {
+	// Search through YAML files to find the one containing this PVC
+	matches, err := filepath.Glob(filepath.Join(e.yamlDirectory, "*.yaml"))
+	if err != nil {
+		return "", err
+	}
+
+	yamlFiles := matches
+	moreMatches, err := filepath.Glob(filepath.Join(e.yamlDirectory, "*.yml"))
+	if err == nil {
+		yamlFiles = append(yamlFiles, moreMatches...)
+	}
+
+	for _, file := range yamlFiles {
+		if e.fileContainsPVC(file, pvc) {
+			return file, nil
+		}
+	}
+
+	return "", fmt.Errorf("no YAML file found containing PVC %s", pvc.Name)
+}
+
+func (e *Engine) fileContainsPVC(filename string, pvc *types.PVCInfo) bool {
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return false
+	}
+
+	// Split content by document separator (---)
+	documents := strings.Split(string(content), "\n---\n")
+
+	for _, doc := range documents {
+		if strings.TrimSpace(doc) == "" {
+			continue
+		}
+
+		var obj map[string]interface{}
+		err := yaml.Unmarshal([]byte(doc), &obj)
+		if err != nil {
+			continue
+		}
+
+		// Check if this is a PVC with the right name
+		if kind, ok := obj["kind"].(string); ok && kind == "PersistentVolumeClaim" {
+			if metadata, ok := obj["metadata"].(map[string]interface{}); ok {
+				if name, ok := metadata["name"].(string); ok && name == pvc.Name {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 func (e *Engine) waitForPVCBound(pvc *types.PVCInfo) error {
@@ -109,26 +161,40 @@ func (e *Engine) waitForPVCBound(pvc *types.PVCInfo) error {
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for PVC %s to be bound", pvc.Name)
 		default:
-			cmd := exec.Command("kubectl", "get", "pvc", pvc.Name, "-n", pvc.Namespace, "-o", "jsonpath={.status.phase}")
+			cmd := exec.Command("kubectl", "get", "pvc", pvc.Name, "-n", e.migrationNamespace, "-o", "jsonpath={.status.phase}")
 			output, err := cmd.Output()
 			if err != nil {
+				fmt.Printf("    Error checking PVC status: %v\n", err)
 				time.Sleep(interval)
 				continue
 			}
 
 			phase := strings.TrimSpace(string(output))
+			fmt.Printf("    PVC status: %s\n", phase)
+
 			if phase == "Bound" {
+				fmt.Printf("    ✅ PVC is now bound!\n")
 				return nil
 			}
 
-			fmt.Printf("    PVC status: %s\n", phase)
+			if phase == "Failed" {
+				return fmt.Errorf("PVC failed to bind")
+			}
+
+			// Don't proceed if PVC is not bound
 			time.Sleep(interval)
 		}
 	}
 }
 
 func (e *Engine) copyData(pvc *types.PVCInfo) error {
-	// Create a temporary pod to mount both the Docker volume and the PVC
+	// Get current node name to schedule migration pod on the same node
+	nodeName, err := e.getCurrentNodeName()
+	if err != nil {
+		return fmt.Errorf("failed to get current node name: %v", err)
+	}
+
+	// Create migration pod in the migration namespace (from --namespace flag)
 	podName := fmt.Sprintf("migration-%s-%d", pvc.Name, time.Now().Unix())
 
 	podYAML := fmt.Sprintf(`apiVersion: v1
@@ -138,6 +204,7 @@ metadata:
   namespace: %s
 spec:
   restartPolicy: Never
+  nodeName: %s
   containers:
   - name: migration
     image: busybox:latest
@@ -174,7 +241,7 @@ spec:
   - name: pvc-volume
     persistentVolumeClaim:
       claimName: %s
-`, podName, pvc.Namespace, pvc.MatchedVolume.Mountpoint, pvc.Name)
+`, podName, e.migrationNamespace, nodeName, pvc.MatchedVolume.Mountpoint, pvc.Name)
 
 	// Create the migration pod
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
@@ -184,24 +251,135 @@ spec:
 		return fmt.Errorf("failed to create migration pod: %v\nOutput: %s", err, string(output))
 	}
 
+	fmt.Printf("  Migration pod %s created in namespace %s, scheduled on node %s\n", podName, e.migrationNamespace, nodeName)
+
 	// Wait for pod to complete
 	fmt.Printf("  Waiting for migration pod to complete...\n")
-	if err := e.waitForPodCompletion(podName, pvc.Namespace); err != nil {
+	if err := e.waitForPodCompletion(podName, e.migrationNamespace); err != nil {
 		return fmt.Errorf("migration pod failed: %v", err)
 	}
 
 	// Show pod logs
 	fmt.Printf("  Migration pod logs:\n")
-	if err := e.showPodLogs(podName, pvc.Namespace); err != nil {
+	if err := e.showPodLogs(podName, e.migrationNamespace); err != nil {
 		fmt.Printf("    Warning: Could not retrieve pod logs: %v\n", err)
 	}
 
 	// Clean up the migration pod
-	if err := e.deletePod(podName, pvc.Namespace); err != nil {
+	if err := e.deletePod(podName, e.migrationNamespace); err != nil {
 		fmt.Printf("    Warning: Could not delete migration pod: %v\n", err)
 	}
 
 	return nil
+}
+
+func (e *Engine) getCurrentNodeName() (string, error) {
+	// Get all available nodes
+	cmd := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={.items[*].metadata.name}")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get node list: %v", err)
+	}
+
+	nodes := strings.Fields(string(output))
+	if len(nodes) == 0 {
+		return "", fmt.Errorf("no Kubernetes nodes found")
+	}
+
+	// Try to find the best default node
+	hostname, _ := os.Hostname()
+	defaultNode := e.findBestDefaultNode(nodes, hostname)
+
+	// Interactive node selection
+	return e.interactiveNodeSelection(nodes, defaultNode)
+}
+
+func (e *Engine) findBestDefaultNode(nodes []string, hostname string) string {
+	// Try to match hostname to node name
+	for _, node := range nodes {
+		if strings.Contains(strings.ToLower(node), strings.ToLower(hostname)) ||
+			strings.Contains(strings.ToLower(hostname), strings.ToLower(node)) {
+			return node
+		}
+	}
+
+	// If no match, return first node
+	if len(nodes) > 0 {
+		return nodes[0]
+	}
+
+	return ""
+}
+
+func (e *Engine) interactiveNodeSelection(nodes []string, defaultNode string) (string, error) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Printf("\nSelect Kubernetes node for migration pods:\n")
+
+	// Find default index
+	for i, node := range nodes {
+		marker := "  "
+		if node == defaultNode {
+			marker = "* "
+		}
+		fmt.Printf("%s%d. %s\n", marker, i+1, node)
+	}
+
+	fmt.Printf("\nDefault: %s (press Enter to use default)\n", defaultNode)
+	fmt.Printf("Enter choice (number 1-%d or node name): ", len(nodes))
+
+	for {
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("failed to read input: %v", err)
+		}
+
+		input = strings.TrimSpace(input)
+
+		// If empty, use default
+		if input == "" {
+			fmt.Printf("Selected: %s (default)\n", defaultNode)
+			return defaultNode, nil
+		}
+
+		// Try to parse as number
+		if choice, err := strconv.Atoi(input); err == nil {
+			if choice >= 1 && choice <= len(nodes) {
+				selected := nodes[choice-1]
+				fmt.Printf("Selected: %s\n", selected)
+				return selected, nil
+			} else {
+				fmt.Printf("Invalid number. Enter 1-%d or node name: ", len(nodes))
+				continue
+			}
+		}
+
+		// Try to match as node name (partial or exact)
+		var matches []string
+		for _, node := range nodes {
+			if strings.EqualFold(node, input) {
+				// Exact match
+				fmt.Printf("Selected: %s\n", node)
+				return node, nil
+			}
+			if strings.Contains(strings.ToLower(node), strings.ToLower(input)) {
+				matches = append(matches, node)
+			}
+		}
+
+		if len(matches) == 1 {
+			// Single partial match
+			fmt.Printf("Selected: %s\n", matches[0])
+			return matches[0], nil
+		} else if len(matches) > 1 {
+			fmt.Printf("Multiple matches found: %s\n", strings.Join(matches, ", "))
+			fmt.Printf("Please be more specific. Enter choice (number 1-%d or node name): ", len(nodes))
+			continue
+		}
+
+		// No matches
+		fmt.Printf("Node '%s' not found. Enter choice (number 1-%d or node name): ", input, len(nodes))
+	}
 }
 
 func (e *Engine) waitForPodCompletion(podName, namespace string) error {
@@ -278,3 +456,4 @@ func (e *Engine) DryRun(pvcs []*types.PVCInfo) {
 
 	fmt.Println("Use --execute to run the actual migration")
 }
+
